@@ -20,6 +20,8 @@ type DecryptedMessage = {
   recipientId: string;
   plaintext: string;
   createdAt: string;
+  deliveredAt: string | null;
+  readAt: string | null;
 };
 
 type IncomingPayload = {
@@ -29,6 +31,14 @@ type IncomingPayload = {
   ciphertext: string;
   algorithm: string;
   createdAt: string;
+  deliveredAt: string | null;
+  readAt: string | null;
+};
+
+type StatusPayload = {
+  messageId: string;
+  deliveredAt: string | null;
+  readAt: string | null;
 };
 
 type Props = {
@@ -68,6 +78,15 @@ export function ChatView({ me, socket, recipient }: Props) {
           .map((m) => decryptStored(m, me))
           .filter((m): m is DecryptedMessage => m !== null);
         setMessages(decrypted);
+
+        // Any history rows that were sent to us and have not yet been marked
+        // read should be marked read now — the conversation is open and the
+        // user is looking at them.
+        for (const m of decrypted) {
+          if (m.recipientId === me.userId && m.readAt === null) {
+            socket.emit('message:read', { messageId: m.id });
+          }
+        }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'history_load_failed');
       } finally {
@@ -78,7 +97,7 @@ export function ChatView({ me, socket, recipient }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [me, recipient.id]);
+  }, [me, recipient.id, socket]);
 
   // Listen for live messages for this conversation only.
   useEffect(() => {
@@ -98,8 +117,21 @@ export function ChatView({ me, socket, recipient }: Props) {
             recipientId: payload.recipientId,
             plaintext,
             createdAt: payload.createdAt,
+            deliveredAt: payload.deliveredAt,
+            readAt: payload.readAt,
           },
         ]);
+
+        // If the message came from the active recipient (i.e. we are the
+        // recipient of this message), transition receipts on the server.
+        // We were able to decrypt the ciphertext above, so the client has
+        // genuinely received the message — that satisfies "delivered". The
+        // conversation is currently open and visible to the user, so we can
+        // also send "read" right away.
+        if (payload.senderId === recipient.id && payload.recipientId === me.userId) {
+          socket.emit('message:delivered', { messageId: payload.id });
+          socket.emit('message:read', { messageId: payload.id });
+        }
       } catch {
         // Ciphertext we can't decrypt isn't useful to surface — likely a stale
         // session from before our keypair was rotated.
@@ -110,6 +142,23 @@ export function ChatView({ me, socket, recipient }: Props) {
       socket.off('message:new', onNew);
     };
   }, [me, recipient.id, socket]);
+
+  // Listen for receipt transitions on any message in the open conversation.
+  useEffect(() => {
+    const onStatus = (payload: StatusPayload) => {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === payload.messageId
+            ? { ...m, deliveredAt: payload.deliveredAt, readAt: payload.readAt }
+            : m,
+        ),
+      );
+    };
+    socket.on('message:status', onStatus);
+    return () => {
+      socket.off('message:status', onStatus);
+    };
+  }, [socket]);
 
   // Auto-scroll to the bottom on new messages.
   useEffect(() => {
@@ -167,7 +216,10 @@ export function ChatView({ me, socket, recipient }: Props) {
               style={{ ...styles.bubble, ...(mine ? styles.mine : styles.theirs) }}
               title={new Date(m.createdAt).toLocaleString()}
             >
-              {m.plaintext}
+              <div>{m.plaintext}</div>
+              {mine && (
+                <div style={styles.statusLine}>{describeStatus(m.deliveredAt, m.readAt)}</div>
+              )}
             </div>
           );
         })}
@@ -203,10 +255,18 @@ function decryptStored(m: StoredMessage, me: Me): DecryptedMessage | null {
       recipientId: m.recipientId,
       plaintext,
       createdAt: m.createdAt,
+      deliveredAt: m.deliveredAt,
+      readAt: m.readAt,
     };
   } catch {
     return null;
   }
+}
+
+function describeStatus(deliveredAt: string | null, readAt: string | null): string {
+  if (readAt) return 'Read';
+  if (deliveredAt) return 'Delivered';
+  return 'Sent';
 }
 
 const styles: Record<string, CSSProperties> = {
@@ -237,6 +297,12 @@ const styles: Record<string, CSSProperties> = {
   },
   mine: { alignSelf: 'flex-end', background: '#dbeafe' },
   theirs: { alignSelf: 'flex-start', background: '#f3f4f6' },
+  statusLine: {
+    fontSize: 11,
+    color: '#475569',
+    marginTop: 2,
+    textAlign: 'right',
+  },
   composer: { borderTop: '1px solid #ddd', padding: 12, display: 'flex', gap: 8 },
   input: { flex: 1, padding: '8px 10px', fontSize: 14 },
   send: { padding: '8px 14px' },

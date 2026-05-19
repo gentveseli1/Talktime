@@ -47,7 +47,13 @@ model Message {
   // can evolve (e.g. to a ratcheted protocol) without ambiguous migrations.
   algorithm   String   @default("x25519-xsalsa20poly1305-sealedbox")
 
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
+  // Delivery receipts. `deliveredAt` is set when the recipient's client
+  // acknowledges receipt of the ciphertext; `readAt` is set when the
+  // conversation is open and the message becomes visible. Only the recipient
+  // can transition these fields, and they are server-assigned timestamps.
+  deliveredAt DateTime?
+  readAt      DateTime?
 
   sender    User @relation("sender",    fields: [senderId],    references: [id])
   recipient User @relation("recipient", fields: [recipientId], references: [id])

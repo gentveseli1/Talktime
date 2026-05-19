@@ -5,7 +5,12 @@ import type { Server as HttpServer } from 'node:http';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { socketAuth } from './auth.js';
-import { persistMessage } from '../services/messages.service.js';
+import {
+  persistMessage,
+  markDelivered,
+  markRead,
+  type StatusUpdate,
+} from '../services/messages.service.js';
 
 type Deps = {
   httpServer: HttpServer;
@@ -24,6 +29,10 @@ const sendSchema = z.object({
   // base64 sealed-box ciphertexts; loose upper bound to reject obvious junk.
   ciphertextForRecipient: z.string().min(1).max(64 * 1024),
   ciphertextForSender: z.string().min(1).max(64 * 1024),
+});
+
+const receiptSchema = z.object({
+  messageId: z.string().min(1).max(64),
 });
 
 export function createSocketServer({ httpServer, pubClient, subClient }: Deps): Server {
@@ -86,6 +95,8 @@ export function createSocketServer({ httpServer, pubClient, subClient }: Deps): 
           ciphertext: stored.ciphertextForRecipient,
           algorithm: stored.algorithm,
           createdAt: stored.createdAt,
+          deliveredAt: stored.deliveredAt,
+          readAt: stored.readAt,
         });
 
         // Confirm to the sender with the sender-readable ciphertext, so any
@@ -98,6 +109,8 @@ export function createSocketServer({ httpServer, pubClient, subClient }: Deps): 
           ciphertext: stored.ciphertextForSender,
           algorithm: stored.algorithm,
           createdAt: stored.createdAt,
+          deliveredAt: stored.deliveredAt,
+          readAt: stored.readAt,
         });
 
         ack?.({ ok: true, id: stored.id, createdAt: stored.createdAt });
@@ -105,7 +118,66 @@ export function createSocketServer({ httpServer, pubClient, subClient }: Deps): 
         ack?.({ ok: false, error: 'persist_failed' });
       }
     });
+
+    // Phase 4: delivery receipts. Only the recipient of a message can mark
+    // it delivered. The server publishes a `message:status` event to the
+    // sender room so the sender's UI can transition Sent → Delivered.
+    socket.on('message:delivered', async (raw: unknown, ack?: (res: unknown) => void) => {
+      const parsed = receiptSchema.safeParse(raw);
+      if (!parsed.success) {
+        ack?.({ ok: false, error: 'invalid_payload' });
+        return;
+      }
+
+      try {
+        const updated = await markDelivered(parsed.data.messageId, userId);
+        if (!updated) {
+          ack?.({ ok: false, error: 'not_recipient_or_not_found' });
+          return;
+        }
+        emitStatus(io, updated);
+        ack?.({ ok: true });
+      } catch {
+        ack?.({ ok: false, error: 'update_failed' });
+      }
+    });
+
+    // Phase 4: read receipts. A read receipt implies delivery, so the
+    // service backfills `deliveredAt` if it was null. Only the recipient
+    // may mark a message read.
+    socket.on('message:read', async (raw: unknown, ack?: (res: unknown) => void) => {
+      const parsed = receiptSchema.safeParse(raw);
+      if (!parsed.success) {
+        ack?.({ ok: false, error: 'invalid_payload' });
+        return;
+      }
+
+      try {
+        const updated = await markRead(parsed.data.messageId, userId);
+        if (!updated) {
+          ack?.({ ok: false, error: 'not_recipient_or_not_found' });
+          return;
+        }
+        emitStatus(io, updated);
+        ack?.({ ok: true });
+      } catch {
+        ack?.({ ok: false, error: 'update_failed' });
+      }
+    });
   });
 
   return io;
+}
+
+// Fan out a `message:status` update to both ends of the conversation so the
+// sender sees the receipt transition immediately and the recipient's other
+// sessions stay in sync.
+function emitStatus(io: Server, update: StatusUpdate) {
+  const payload = {
+    messageId: update.id,
+    deliveredAt: update.deliveredAt,
+    readAt: update.readAt,
+  };
+  io.to(userRoom(update.senderId)).emit('message:status', payload);
+  io.to(userRoom(update.recipientId)).emit('message:status', payload);
 }

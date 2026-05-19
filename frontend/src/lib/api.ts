@@ -54,7 +54,9 @@ export const api = {
 };
 
 // A row as returned by GET /messages/:recipientId. Both sealed-box copies are
-// included so the client can pick the one it can actually decrypt.
+// included so the client can pick the one it can actually decrypt. The
+// `deliveredAt`/`readAt` receipt timestamps are server-assigned and are
+// nullable until the recipient transitions them.
 export type StoredMessage = {
   id: string;
   senderId: string;
@@ -63,4 +65,6 @@ export type StoredMessage = {
   ciphertextForSender: string;
   algorithm: string;
   createdAt: string;
+  deliveredAt: string | null;
+  readAt: string | null;
 };
