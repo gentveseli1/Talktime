@@ -51,6 +51,18 @@ export const api = {
 
   getMessages: (token: string, recipientId: string) =>
     request<{ messages: StoredMessage[] }>(`/messages/${recipientId}`, {}, token),
+
+  getPresence: (token: string) =>
+    request<{ presence: PresenceEntry[] }>('/presence', {}, token),
+};
+
+// One row from GET /presence and from the Socket.IO `presence:update` event.
+// `lastSeenAt` is null while the user is online; once they go offline it
+// holds the ISO timestamp of the moment their last socket disconnected.
+export type PresenceEntry = {
+  userId: string;
+  online: boolean;
+  lastSeenAt: string | null;
 };
 
 // A row as returned by GET /messages/:recipientId. Both sealed-box copies are

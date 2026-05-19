@@ -8,6 +8,7 @@ import { authRouter } from './routes/auth.js';
 import { keysRouter } from './routes/keys.js';
 import { usersRouter } from './routes/users.js';
 import { messagesRouter } from './routes/messages.js';
+import { presenceRouter } from './routes/presence.js';
 
 export function createApp(redisClient: Redis) {
   const app = express();
@@ -21,6 +22,7 @@ export function createApp(redisClient: Redis) {
   app.use('/keys', keysRouter);
   app.use('/users', usersRouter);
   app.use('/messages', messagesRouter);
+  app.use('/presence', presenceRouter(redisClient));
 
   return app;
 }

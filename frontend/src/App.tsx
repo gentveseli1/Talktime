@@ -1,6 +1,6 @@
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import { api, type AuthResponse } from './lib/api';
+import { api, type AuthResponse, type PresenceEntry } from './lib/api';
 import { connectSocket, disconnectSocket } from './lib/socket';
 import { generateKeyPair, ready as cryptoReady } from './lib/crypto';
 import { loadKeyPair, saveKeyPair } from './storage/keys';
@@ -17,6 +17,7 @@ export function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [users, setUsers] = useState<ChatUser[]>([]);
+  const [presence, setPresence] = useState<Map<string, PresenceEntry>>(new Map());
   const [selected, setSelected] = useState<ChatUser | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [healthNode, setHealthNode] = useState<string | null>(null);
@@ -34,20 +35,47 @@ export function App() {
     s.on('connect', () => {
       s.emit('ping', (reply: { nodeId: string }) => setSocketNode(reply.nodeId));
     });
+
+    // Live presence transitions. The server broadcasts to a shared room
+    // (any logged-in client subscribes) and the Redis adapter fans the
+    // event out across backend nodes.
+    const onPresence = (entry: PresenceEntry) => {
+      setPresence((prev) => {
+        const next = new Map(prev);
+        next.set(entry.userId, entry);
+        return next;
+      });
+    };
+    s.on('presence:update', onPresence);
+
     setSocket(s);
     return () => {
+      s.off('presence:update', onPresence);
       disconnectSocket();
       setSocket(null);
     };
   }, [session]);
 
-  // Load the user list once authenticated.
+  // Load the user list + initial presence snapshot once authenticated.
   useEffect(() => {
     if (!session) return;
     api
       .listUsers(session.user.token)
       .then((res) => setUsers(res.users))
       .catch((err) => setError(err instanceof Error ? err.message : 'load_users_failed'));
+    api
+      .getPresence(session.user.token)
+      .then((res) => {
+        const map = new Map<string, PresenceEntry>();
+        for (const entry of res.presence) map.set(entry.userId, entry);
+        // Merge with anything the live socket has already pushed in.
+        setPresence((prev) => {
+          const merged = new Map(map);
+          for (const [k, v] of prev) merged.set(k, v);
+          return merged;
+        });
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : 'load_presence_failed'));
   }, [session]);
 
   async function handleRegister(e: FormEvent<HTMLFormElement>) {
@@ -102,6 +130,7 @@ export function App() {
     setSession(null);
     setSocket(null);
     setUsers([]);
+    setPresence(new Map());
     setSelected(null);
     setSocketNode(null);
     setHealthNode(null);
@@ -162,6 +191,7 @@ export function App() {
           users={users}
           selectedId={selected?.id ?? null}
           onSelect={setSelected}
+          presence={presence}
         />
         {selected && socket ? (
           <ChatView

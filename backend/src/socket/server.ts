@@ -11,6 +11,13 @@ import {
   markRead,
   type StatusUpdate,
 } from '../services/messages.service.js';
+import { trackConnect, trackDisconnect } from '../services/presence.service.js';
+
+// Global room every authenticated socket joins on connect. We broadcast
+// presence updates here so any logged-in client sees every other user's
+// online/offline transitions, regardless of which backend node holds the
+// emitting socket. The Redis Socket.IO adapter handles cross-node fan-out.
+const PRESENCE_ROOM = 'presence';
 
 type Deps = {
   httpServer: HttpServer;
@@ -51,6 +58,43 @@ export function createSocketServer({ httpServer, pubClient, subClient }: Deps): 
   io.on('connection', (socket) => {
     const userId = socket.data.userId as string;
     socket.join(userRoom(userId));
+    socket.join(PRESENCE_ROOM);
+
+    // Presence: increment the shared Redis counter. If this is the user's
+    // first active socket across all backend nodes, broadcast that they
+    // are now online. Concurrent connects on different nodes are safe
+    // because HINCRBY is atomic.
+    void (async () => {
+      try {
+        const cameOnline = await trackConnect(pubClient, userId);
+        if (cameOnline) {
+          io.to(PRESENCE_ROOM).emit('presence:update', {
+            userId,
+            online: true,
+            lastSeenAt: null,
+          });
+        }
+      } catch {
+        // Presence is best-effort; an error here must not block chat.
+      }
+    })();
+
+    socket.on('disconnect', () => {
+      void (async () => {
+        try {
+          const lastSeenAt = await trackDisconnect(pubClient, userId);
+          if (lastSeenAt !== null) {
+            io.to(PRESENCE_ROOM).emit('presence:update', {
+              userId,
+              online: false,
+              lastSeenAt,
+            });
+          }
+        } catch {
+          // ignore
+        }
+      })();
+    });
 
     // v1 round-trip event — confirms which node handled the connection.
     socket.on('ping', (cb?: (payload: { nodeId: string; userId: string }) => void) => {
