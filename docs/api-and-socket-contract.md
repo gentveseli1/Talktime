@@ -41,8 +41,10 @@ Known error codes used by the API:
 | `username_or_email_taken`     | 409  | `POST /auth/register`       | Prisma unique-constraint violation      |
 | `not_found`                   | 404  | `GET /keys/:userId`         | No user with that id                    |
 | `cannot_message_self`         | n/a  | `message:send` ack          | `recipientId === self`                  |
-| `invalid_payload`             | n/a  | `message:send` ack          | zod validation failed                   |
+| `invalid_payload`             | n/a  | `message:send` / `message:delivered` / `message:read` ack | zod validation failed |
 | `persist_failed`              | n/a  | `message:send` ack          | DB insert failed                        |
+| `not_recipient_or_not_found`  | n/a  | `message:delivered` / `message:read` ack | Caller is not the recipient of that message, or the id does not exist |
+| `update_failed`               | n/a  | `message:delivered` / `message:read` ack | DB update failed                |
 
 ---
 
@@ -201,7 +203,9 @@ Return the full encrypted message history between the caller and
       "ciphertextForRecipient": "base64...",
       "ciphertextForSender": "base64...",
       "algorithm": "x25519-xsalsa20poly1305-sealedbox",
-      "createdAt": "2026-05-19T10:01:23.456Z"
+      "createdAt": "2026-05-19T10:01:23.456Z",
+      "deliveredAt": "2026-05-19T10:01:24.012Z",
+      "readAt": null
     }
   ]
 }
@@ -213,7 +217,41 @@ actually decrypt:
 - For rows where `senderId === self.id`, decrypt `ciphertextForSender`.
 - Otherwise, decrypt `ciphertextForRecipient`.
 
-See [`database-model.md`](database-model.md) for why two copies exist.
+`deliveredAt` and `readAt` are server-assigned receipt timestamps. Both are
+`null` until the recipient transitions them via `message:delivered` /
+`message:read` (see below). See [`database-model.md`](database-model.md)
+for why two copies of the ciphertext exist.
+
+**Errors:** `401 missing_token`, `401 invalid_token`.
+
+---
+
+### `GET /presence`
+
+Return the current online/offline state of every user the caller is allowed
+to see — for the v1 1:1-DM-only scope that means every user other than the
+caller. The shape matches the Socket.IO `presence:update` event so a client
+can fold the snapshot and the live stream into the same local state.
+
+**Auth:** required.
+
+**Response 200:**
+
+```json
+{
+  "presence": [
+    { "userId": "ckabc...", "online": true,  "lastSeenAt": null },
+    { "userId": "ckdef...", "online": false, "lastSeenAt": "2026-05-19T10:00:00.000Z" }
+  ]
+}
+```
+
+- `online` is `true` while at least one of that user's sockets is connected
+  to any of the three backend nodes.
+- `lastSeenAt` is `null` while the user is online, and the ISO-8601
+  timestamp of the moment their last socket disconnected once they are
+  offline. Users who have never connected return `online:false,
+  lastSeenAt:null`.
 
 **Errors:** `401 missing_token`, `401 invalid_token`.
 
@@ -311,9 +349,11 @@ sender as confirmation (with their own decryptable copy).
   id: string,
   senderId: string,
   recipientId: string,
-  ciphertext: string,    // the copy the receiving client can decrypt
-  algorithm: string,     // e.g. "x25519-xsalsa20poly1305-sealedbox"
-  createdAt: string      // ISO-8601
+  ciphertext: string,             // the copy the receiving client can decrypt
+  algorithm: string,              // e.g. "x25519-xsalsa20poly1305-sealedbox"
+  createdAt: string,              // ISO-8601
+  deliveredAt: string | null,     // receipt timestamps (initially null)
+  readAt: string | null
 }
 ```
 
@@ -321,6 +361,121 @@ The client decrypts `ciphertext` with its own keypair using
 `crypto_box_seal_open`. The client must already know its own public and
 private key (the private key never leaves the browser; it lives in
 IndexedDB).
+
+### Event: `message:delivered` (client → server, with ack)
+
+Mark a received message as delivered. Only the recipient of the message can
+transition this field. Idempotent: re-sending after `deliveredAt` is already
+set does not change anything and is acked `{ ok: true }`.
+
+**Payload:**
+
+```ts
+{ messageId: string }
+```
+
+**Ack on success:** `{ "ok": true }`. **Ack on failure:**
+
+```json
+{ "ok": false, "error": "invalid_payload" | "not_recipient_or_not_found" | "update_failed" }
+```
+
+On success the server emits `message:status` to both ends of the
+conversation (see below).
+
+### Event: `message:read` (client → server, with ack)
+
+Mark a received message as read. Only the recipient can transition this
+field. A read receipt implies delivery, so the server backfills
+`deliveredAt` to the same timestamp as `readAt` if it was still `null`.
+Idempotent on re-emit.
+
+**Payload:**
+
+```ts
+{ messageId: string }
+```
+
+**Ack on success:** `{ "ok": true }`. **Ack on failure:**
+
+```json
+{ "ok": false, "error": "invalid_payload" | "not_recipient_or_not_found" | "update_failed" }
+```
+
+On success the server emits `message:status` to both ends of the
+conversation (see below).
+
+### Event: `message:status` (server → both ends)
+
+Pushed to the sender and the recipient of a message whenever either of its
+receipt timestamps changes.
+
+**Payload:**
+
+```ts
+{
+  messageId: string,
+  deliveredAt: string | null,
+  readAt: string | null
+}
+```
+
+Clients should treat this as a patch against their local copy of the
+message row (matched by `messageId`).
+
+### Event: `presence:update` (server → all sockets in the `presence` room)
+
+Every authenticated socket auto-joins a global `presence` room on connect.
+The server publishes a `presence:update` whenever a user transitions from
+offline to online (their first socket connects across all backend nodes) or
+from online to offline (their last socket disconnects).
+
+**Payload:**
+
+```ts
+{
+  userId: string,
+  online: boolean,
+  lastSeenAt: string | null    // null while online; ISO-8601 once offline
+}
+```
+
+The 0→1 / 1→0 gating means multiple tabs from the same user produce only
+two events total — one online, one offline — not one per tab. Cross-node
+delivery is handled by the Redis adapter.
+
+### Event: `typing:start` / `typing:stop` (client → server)
+
+Tell the server that the caller has started or stopped typing in their
+conversation with a given recipient. No ack. Self-targeting is dropped
+silently; malformed payloads (missing `recipientId`, etc.) are dropped
+silently. Nothing is persisted to the database and the server logs no
+typing content.
+
+**Payload:**
+
+```ts
+{ recipientId: string }
+```
+
+On a valid event the server emits a corresponding `typing:update` to the
+recipient's user room (only — typing is not echoed back to the sender).
+
+### Event: `typing:update` (server → recipient's user room)
+
+Push that tells a user one of their peers has started or stopped typing in
+their direct conversation.
+
+**Payload:**
+
+```ts
+{
+  userId: string,    // the sender of the typing event
+  typing: boolean
+}
+```
+
+Cross-node delivery is again handled by the Redis adapter.
 
 ---
 

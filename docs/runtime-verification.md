@@ -12,8 +12,10 @@ same commands and expect the same observable results.
 ## Environment under test
 
 - Docker Engine 29.4.1 (Compose v2)
-- 7 services: `postgres-primary`, `postgres-replica`, `redis`, `backend-1`,
-  `backend-2`, `backend-3`, `nginx` (Phase 5 added `postgres-replica`)
+- 7 services after Phase 5: `postgres-primary`, `postgres-replica`,
+  `redis`, `backend-1`, `backend-2`, `backend-3`, `nginx`. Phase 5 added
+  `postgres-replica`. Phases 6 and 7 only add Redis keys and Socket.IO
+  events — no new containers.
 - Backend image built from `./backend` (Node.js 20, TypeScript, Express,
   Socket.IO, Prisma)
 - Frontend served by Vite dev server on `:5173` (not in the compose file,
@@ -27,7 +29,7 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Expected: all six services reach state `running` and the three backends + Nginx
+Expected: all seven services reach state `running` and the three backends + Nginx
 report `healthy`. Postgres and Redis use their built-in healthchecks; backends
 use `GET /health`.
 
@@ -235,6 +237,80 @@ the plaintexts matched the originals.
 | `message:send` with missing fields                | ack `{ ok: false, error: "invalid_payload" }`         | pass   |
 | `message:send` with oversize ciphertext (>64 KiB) | ack `{ ok: false, error: "invalid_payload" }`         | pass   |
 | Socket connect without JWT                        | `connect_error` from the server, no connection        | pass   |
+
+## 11. Presence (Phase 6)
+
+End-to-end check using a Node.js client driving real `socket.io-client`
+connections against three running backend nodes. No mocks.
+
+Flow:
+
+1. Register two users (`alice`, `bob`) via `POST /auth/register`.
+2. Open Alice's socket.
+3. Open Bob's socket and wait on Alice for `presence:update` matching
+   `{ userId: bob.userId, online: true }`.
+4. Fetch `GET /presence` as Alice and Bob; check each sees the other as
+   online with `lastSeenAt: null`.
+5. Disconnect Bob's socket; wait on Alice for
+   `presence:update { online: false, lastSeenAt: <ISO> }`.
+6. Fetch `GET /presence` as Alice; confirm Bob is now offline with a
+   non-null `lastSeenAt`.
+7. Reconnect Bob; wait on Alice for an online event again.
+8. **Multi-tab:** open two Bob sockets, close one, confirm Alice does not
+   receive a transition to offline. Close the second; confirm Alice does
+   receive offline.
+
+| Assertion                                                       | Result |
+|-----------------------------------------------------------------|--------|
+| Alice sees `presence:update {bob, online:true}` when Bob connects | pass   |
+| `GET /presence` (Alice) reports Bob online, `lastSeenAt:null`   | pass   |
+| `GET /presence` (Bob) reports Alice online, `lastSeenAt:null`   | pass   |
+| Alice sees `{bob, online:false, lastSeenAt:<iso>}` on disconnect | pass   |
+| `GET /presence` (Alice) reports Bob offline with `lastSeenAt`   | pass   |
+| Alice sees Bob online again after reconnect                     | pass   |
+| Closing one of two Bob sockets does **not** flip Bob offline    | pass   |
+| Closing the last Bob socket flips Bob offline                   | pass   |
+
+Observed: 8/8 assertions passed.
+
+The atomic `HINCRBY presence:counts` is what makes the multi-tab and the
+multi-node cases correct: two backend nodes racing on the same user end
+up with the same total count in Redis.
+
+## 12. Typing indicators (Phase 7)
+
+End-to-end check using a Node.js client driving two real socket clients
+through Nginx.
+
+Flow:
+
+1. Register two users, open both sockets.
+2. Bob emits `typing:start { recipientId: alice.userId }`; Alice must
+   receive `typing:update { userId: bob.userId, typing: true }`.
+3. Bob emits a second `typing:start` and Bob's own socket subscribes to
+   `typing:update` — the server must **not** echo the event back to the
+   sender.
+4. Bob emits `typing:start` with `recipientId === bob.userId` (self).
+   Neither side should receive anything.
+5. Bob emits `typing:stop`; Alice must receive
+   `typing:update { typing: false }`.
+6. Bob emits `typing:start {}` (missing field). Alice's socket should not
+   receive anything.
+
+| Assertion                                              | Result |
+|--------------------------------------------------------|--------|
+| Alice receives `typing:update {typing:true}` on start  | pass   |
+| Server does not echo typing back to the sender         | pass   |
+| Self-targeted typing event is dropped                  | pass   |
+| Alice receives `typing:update {typing:false}` on stop  | pass   |
+| Malformed payload (missing `recipientId`) is dropped   | pass   |
+
+Observed: 5/5 assertions passed.
+
+Nothing is persisted: `\dt` on `postgres-primary` still shows only `User`
+and `Message`, and `SELECT count(*) FROM "Message";` does not change
+across a typing burst. Nothing is logged: the backend's pino output
+contains no entry mentioning `typing` at `info` level.
 
 ## Notes and caveats
 

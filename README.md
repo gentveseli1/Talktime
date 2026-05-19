@@ -166,8 +166,8 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Wait until all six services (`postgres`, `redis`, `backend-1/2/3`, `nginx`)
-report `healthy`.
+Wait until all seven services (`postgres-primary`, `postgres-replica`,
+`redis`, `backend-1/2/3`, `nginx`) report `healthy`.
 
 ### 2. Sync the Prisma schema
 
@@ -227,6 +227,111 @@ Send a few more messages in both directions. Reload Alice's browser to prove
 that history decrypts correctly on session restart (Alice decrypts the
 `ciphertextForSender` field for messages she sent, and the
 `ciphertextForRecipient` field for messages Bob sent her).
+
+### 5a. Show online/offline presence (Phase 6)
+
+The user list in each browser shows a coloured dot and a label next to
+every other user:
+
+- Green dot + "Online" — that user has at least one socket connected to
+  any of the three backend nodes.
+- Grey dot + "Last seen Xm ago" / "Offline" — no sockets connected;
+  `lastSeenAt` is the timestamp of their last disconnect.
+
+To demo:
+
+1. With both browsers signed in, confirm Alice's list shows Bob as
+   "Online" and vice versa.
+2. Close Bob's browser entirely (or `docker compose stop` Bob's tab).
+   Within a second, Alice's list flips Bob to "Last seen just now".
+3. Open Bob again — Alice's list flips Bob back to "Online" without
+   refreshing.
+
+What is happening: every authenticated socket joins a global `presence`
+room. `HINCRBY presence:counts <userId>` in Redis tracks the open-socket
+count for each user across all three backend nodes; the server only emits
+`presence:update` on the 0→1 and 1→0 transitions, so opening a second tab
+does **not** double-fire. The initial snapshot for the page load comes
+from `GET /presence`.
+
+### 5b. Show the typing indicator (Phase 7)
+
+With Alice's chat with Bob open, start typing in Bob's composer. Alice
+sees "`Bob is typing…`" appear under the message thread. Stop typing — it
+disappears after ≈1.2 s. Send the message — the indicator clears
+immediately and the message bubble appears.
+
+Behind the scenes Bob's client emits `typing:start { recipientId }` on
+the first keystroke, debounces a `typing:stop` 1200 ms after the last
+keystroke (or sends it immediately on send / on clearing the input), and
+the server forwards `typing:update { userId, typing }` to Alice's user
+room only — typing is never echoed to the sender, and self-targeting is
+dropped. Nothing about typing is ever written to PostgreSQL or logged.
+
+### 5c. Show delivery and read receipts (Phase 4)
+
+Every message Alice sends shows a small label under her bubble:
+
+- "**Sent**" — the server has acknowledged the message; the recipient is
+  not yet known to have received it.
+- "**Delivered**" — Bob's client has acknowledged decryption of the
+  ciphertext (via `message:delivered`).
+- "**Read**" — Bob has the conversation open and his client has emitted
+  `message:read`.
+
+To demo:
+
+1. While Bob has the chat with Alice **closed**, have Alice send a
+   message. Alice sees "Sent" (Bob's socket is connected and decrypts
+   the ciphertext, so it actually transitions to "Delivered" almost
+   immediately — to keep the "Sent" state visible, briefly close Bob's
+   browser before Alice sends, then reopen).
+2. Open Bob's chat with Alice. Alice's bubble transitions through
+   "Delivered" → "Read" in real time.
+3. Read receipts imply delivery, so the server backfills `deliveredAt`
+   on a `message:read` if it wasn't already set — see
+   [`docs/api-and-socket-contract.md`](docs/api-and-socket-contract.md).
+
+The receipt timestamps are stored in the `Message.deliveredAt` /
+`Message.readAt` columns and therefore replicate to `postgres-replica`
+along with the ciphertext.
+
+### 5d. Show database replication (Phase 5)
+
+Read the most recent rows from both database servers and confirm they
+match byte-for-byte:
+
+```bash
+docker compose exec postgres-primary psql -U chat -d chat -c \
+  'SELECT count(*) FROM "Message";'
+docker compose exec postgres-replica psql -U chat -d chat -c \
+  'SELECT count(*) FROM "Message";'
+
+docker compose exec postgres-primary psql -U chat -d chat -tAc \
+  'SELECT md5("ciphertextForRecipient") FROM "Message" ORDER BY "createdAt" DESC LIMIT 1;'
+docker compose exec postgres-replica psql -U chat -d chat -tAc \
+  'SELECT md5("ciphertextForRecipient") FROM "Message" ORDER BY "createdAt" DESC LIMIT 1;'
+```
+
+Same count, same MD5 — the WAL stream is up. Confirm one server is
+writable and the other is in recovery:
+
+```bash
+docker compose exec postgres-primary psql -U chat -d chat -tAc 'SELECT pg_is_in_recovery();'  # f
+docker compose exec postgres-replica psql -U chat -d chat -tAc 'SELECT pg_is_in_recovery();'  # t
+```
+
+Try writing to the replica to show it refuses:
+
+```bash
+docker compose exec postgres-replica psql -U chat -d chat \
+  -c "INSERT INTO \"User\" (id, username, email, \"passwordHash\", \"publicKey\")
+      VALUES ('x','x','x','x','x');"
+# expected: ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+The full discussion lives in
+[`docs/database-replication.md`](docs/database-replication.md).
 
 ### 6. Stop a backend node — show failover
 
@@ -429,6 +534,13 @@ delivery, which is what makes the backend horizontally scalable.
 - **Phase 5 — Database replication.** `postgres-primary` + `postgres-replica`
   via PostgreSQL streaming replication, encrypted history visible
   byte-for-byte on both servers. ✅ done.
+- **Phase 6 — Online/offline presence.** Redis-backed socket-count
+  presence with multi-tab / multi-node correctness, `GET /presence`
+  snapshot, live `presence:update` broadcasts, green/grey dots and
+  "Last seen" label in the user list. ✅ done.
+- **Phase 7 — Typing indicators.** `typing:start` / `typing:stop` /
+  `typing:update` Socket.IO events with debounce, recipient-only
+  delivery, no persistence and no logging. ✅ done.
 - **Out of scope for v1.** Group chat, file upload, message pagination
   beyond the 200-row cap, key rotation, multi-device key sync, forward
   secrecy, production-grade Nginx (TLS, rate limiting), automated tests,
