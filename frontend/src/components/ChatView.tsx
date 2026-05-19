@@ -47,12 +47,21 @@ type Props = {
   recipient: ChatUser;
 };
 
+const TYPING_DEBOUNCE_MS = 1200;
+
 export function ChatView({ me, socket, recipient }: Props) {
   const [messages, setMessages] = useState<DecryptedMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [recipientTyping, setRecipientTyping] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Tracks the in-flight "stop typing" timer and whether we've already told
+  // the server we're typing (so we don't re-emit `typing:start` on every
+  // keystroke).
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sentTypingStartRef = useRef(false);
 
   // Sort by createdAt, dedup by id — events can arrive both from history and live.
   const sorted = useMemo(
@@ -143,6 +152,71 @@ export function ChatView({ me, socket, recipient }: Props) {
     };
   }, [me, recipient.id, socket]);
 
+  // Typing indicator from the active recipient. We only react when the
+  // event's userId matches the open conversation — typing notices for
+  // other people in the user list are ignored here (the user list does
+  // not surface typing in v1).
+  useEffect(() => {
+    setRecipientTyping(false);
+    const onTyping = (payload: { userId: string; typing: boolean }) => {
+      if (payload.userId !== recipient.id) return;
+      setRecipientTyping(payload.typing);
+    };
+    socket.on('typing:update', onTyping);
+    return () => {
+      socket.off('typing:update', onTyping);
+    };
+  }, [recipient.id, socket]);
+
+  // When the active conversation changes (or the component unmounts), make
+  // sure we don't leave a "still typing" state hanging on the server.
+  useEffect(() => {
+    return () => {
+      if (typingTimerRef.current !== null) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      if (sentTypingStartRef.current) {
+        socket.emit('typing:stop', { recipientId: recipient.id });
+        sentTypingStartRef.current = false;
+      }
+    };
+  }, [recipient.id, socket]);
+
+  function handleDraftChange(value: string) {
+    setDraft(value);
+
+    if (value.length === 0) {
+      // The user cleared the input — stop immediately rather than waiting
+      // for the debounce.
+      if (typingTimerRef.current !== null) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      if (sentTypingStartRef.current) {
+        socket.emit('typing:stop', { recipientId: recipient.id });
+        sentTypingStartRef.current = false;
+      }
+      return;
+    }
+
+    if (!sentTypingStartRef.current) {
+      socket.emit('typing:start', { recipientId: recipient.id });
+      sentTypingStartRef.current = true;
+    }
+
+    if (typingTimerRef.current !== null) {
+      clearTimeout(typingTimerRef.current);
+    }
+    typingTimerRef.current = setTimeout(() => {
+      if (sentTypingStartRef.current) {
+        socket.emit('typing:stop', { recipientId: recipient.id });
+        sentTypingStartRef.current = false;
+      }
+      typingTimerRef.current = null;
+    }, TYPING_DEBOUNCE_MS);
+  }
+
   // Listen for receipt transitions on any message in the open conversation.
   useEffect(() => {
     const onStatus = (payload: StatusPayload) => {
@@ -182,6 +256,17 @@ export function ChatView({ me, socket, recipient }: Props) {
 
     setDraft('');
     setError(null);
+
+    // The conversation has produced a concrete message — there is nothing
+    // left to "still be typing" about. Clear the indicator immediately.
+    if (typingTimerRef.current !== null) {
+      clearTimeout(typingTimerRef.current);
+      typingTimerRef.current = null;
+    }
+    if (sentTypingStartRef.current) {
+      socket.emit('typing:stop', { recipientId: recipient.id });
+      sentTypingStartRef.current = false;
+    }
 
     socket.emit(
       'message:send',
@@ -225,12 +310,18 @@ export function ChatView({ me, socket, recipient }: Props) {
         })}
       </div>
 
+      {recipientTyping && (
+        <div style={styles.typingIndicator} aria-live="polite">
+          {recipient.username} is typing…
+        </div>
+      )}
+
       {error && <p style={styles.error}>{error}</p>}
 
       <form onSubmit={handleSend} style={styles.composer}>
         <input
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => handleDraftChange(e.target.value)}
           placeholder={`Message ${recipient.username}…`}
           style={styles.input}
           autoFocus
@@ -302,6 +393,12 @@ const styles: Record<string, CSSProperties> = {
     color: '#475569',
     marginTop: 2,
     textAlign: 'right',
+  },
+  typingIndicator: {
+    padding: '4px 16px',
+    fontSize: 12,
+    color: '#6b7280',
+    fontStyle: 'italic',
   },
   composer: { borderTop: '1px solid #ddd', padding: 12, display: 'flex', gap: 8 },
   input: { flex: 1, padding: '8px 10px', fontSize: 14 },

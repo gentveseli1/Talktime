@@ -42,6 +42,13 @@ const receiptSchema = z.object({
   messageId: z.string().min(1).max(64),
 });
 
+// Typing indicators carry no message body — only the addressee — so the
+// schema is intentionally tiny. There is no plaintext to validate against
+// because there is no plaintext on the wire.
+const typingSchema = z.object({
+  recipientId: z.string().min(1).max(64),
+});
+
 export function createSocketServer({ httpServer, pubClient, subClient }: Deps): Server {
   const options: Partial<ServerOptions> = {
     cors: { origin: env.CORS_ORIGIN, credentials: true },
@@ -78,6 +85,33 @@ export function createSocketServer({ httpServer, pubClient, subClient }: Deps): 
         // Presence is best-effort; an error here must not block chat.
       }
     })();
+
+    // Phase 7: typing indicators. The two events are pure pass-through —
+    // the server validates the payload, rejects self-targeting, and emits
+    // a `typing:update` to the recipient's user room. Nothing is
+    // persisted; nothing is logged. The Redis adapter handles cross-node
+    // delivery the same way it does for `message:new`.
+    socket.on('typing:start', (raw: unknown) => {
+      const parsed = typingSchema.safeParse(raw);
+      if (!parsed.success) return;
+      const { recipientId } = parsed.data;
+      if (recipientId === userId) return;
+      io.to(userRoom(recipientId)).emit('typing:update', {
+        userId,
+        typing: true,
+      });
+    });
+
+    socket.on('typing:stop', (raw: unknown) => {
+      const parsed = typingSchema.safeParse(raw);
+      if (!parsed.success) return;
+      const { recipientId } = parsed.data;
+      if (recipientId === userId) return;
+      io.to(userRoom(recipientId)).emit('typing:update', {
+        userId,
+        typing: false,
+      });
+    });
 
     socket.on('disconnect', () => {
       void (async () => {
