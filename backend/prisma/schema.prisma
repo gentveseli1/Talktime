@@ -1,0 +1,57 @@
+// Distributed real-time E2EE chat — initial schema.
+//
+// The server stores only ciphertext. Plaintext message bodies never reach
+// the database, which is enforced at the application layer (no plaintext
+// columns exist below).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String   @unique
+  passwordHash String
+  // base64-encoded X25519 public key uploaded by the client at registration.
+  // The matching private key never leaves the user's browser.
+  publicKey    String
+  createdAt    DateTime @default(now())
+
+  sentMessages     Message[] @relation("sender")
+  receivedMessages Message[] @relation("recipient")
+}
+
+model Message {
+  id          String   @id @default(cuid())
+  senderId    String
+  recipientId String
+
+  // Two base64-encoded libsodium sealed-box ciphertexts of the same plaintext:
+  //   * `ciphertextForRecipient` — sealed to the recipient's public key.
+  //   * `ciphertextForSender`    — sealed to the sender's own public key, so
+  //     the sender can decrypt their own history on any later session.
+  // crypto_box_seal embeds an ephemeral key + nonce inside each blob, so no
+  // separate nonce column is required. Sealed boxes are one-way (the sender
+  // cannot decrypt their own ciphertextForRecipient), which is why a second
+  // copy is necessary for the sender's history.
+  ciphertextForRecipient String
+  ciphertextForSender    String
+
+  // Identifier of the encryption scheme used. Stored explicitly so the scheme
+  // can evolve (e.g. to a ratcheted protocol) without ambiguous migrations.
+  algorithm   String   @default("x25519-xsalsa20poly1305-sealedbox")
+
+  createdAt   DateTime @default(now())
+
+  sender    User @relation("sender",    fields: [senderId],    references: [id])
+  recipient User @relation("recipient", fields: [recipientId], references: [id])
+
+  @@index([recipientId, createdAt])
+  @@index([senderId, createdAt])
+}
