@@ -1,18 +1,66 @@
 services:
-  postgres:
+  postgres-primary:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-chat}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chat}
       POSTGRES_DB: ${POSTGRES_DB:-chat}
+      # Read by primary-init.sh during initdb to create the replication role.
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator-pw}
+    # Enable WAL streaming and a few headroom settings for the replica.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "wal_keep_size=64MB"
+      - "-c"
+      - "listen_addresses=*"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./infra/postgres/primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chat} -d ${POSTGRES_DB:-chat}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+
+  postgres-replica:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # The replica re-uses the superuser password so direct read queries
+      # from outside (e.g. `psql` for the demo) work the same way.
+      POSTGRES_USER: ${POSTGRES_USER:-chat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chat}
+      POSTGRES_DB: ${POSTGRES_DB:-chat}
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator-pw}
+      PRIMARY_HOST: postgres-primary
+      PRIMARY_PORT: "5432"
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: ["/bin/bash", "/usr/local/bin/replica-entrypoint.sh"]
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./infra/postgres/replica-entrypoint.sh:/usr/local/bin/replica-entrypoint.sh:ro
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      # `pg_isready` returns 0 once the standby has accepted connections,
+      # which is what we want from a "replica is up" check.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chat} -d ${POSTGRES_DB:-chat}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   redis:
     image: redis:7-alpine
@@ -29,13 +77,15 @@ services:
     environment:
       NODE_ID: node-1
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chat}:${POSTGRES_PASSWORD:-chat}@postgres:5432/${POSTGRES_DB:-chat}
+      # All backend writes go to the primary. Replicas are read-only and
+      # never receive direct application writes — they catch up via WAL.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chat}:${POSTGRES_PASSWORD:-chat}@postgres-primary:5432/${POSTGRES_DB:-chat}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-replace-me-with-long-random-string}
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
     depends_on:
-      postgres:
+      postgres-primary:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -51,13 +101,13 @@ services:
     environment:
       NODE_ID: node-2
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chat}:${POSTGRES_PASSWORD:-chat}@postgres:5432/${POSTGRES_DB:-chat}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chat}:${POSTGRES_PASSWORD:-chat}@postgres-primary:5432/${POSTGRES_DB:-chat}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-replace-me-with-long-random-string}
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
     depends_on:
-      postgres:
+      postgres-primary:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -73,13 +123,13 @@ services:
     environment:
       NODE_ID: node-3
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chat}:${POSTGRES_PASSWORD:-chat}@postgres:5432/${POSTGRES_DB:-chat}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chat}:${POSTGRES_PASSWORD:-chat}@postgres-primary:5432/${POSTGRES_DB:-chat}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-replace-me-with-long-random-string}
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
     depends_on:
-      postgres:
+      postgres-primary:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -105,4 +155,5 @@ services:
         condition: service_healthy
 
 volumes:
-  postgres_data:
+  postgres_primary_data:
+  postgres_replica_data:

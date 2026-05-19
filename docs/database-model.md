@@ -211,7 +211,7 @@ The simplest demo is to send a few messages from the UI, then read the raw
 ### Option A — psql
 
 ```bash
-docker compose exec postgres \
+docker compose exec postgres-primary \
   psql -U chat -d chat \
   -c 'SELECT id, "senderId", "recipientId", algorithm,
              left("ciphertextForRecipient", 32) AS recip_ct_head,
@@ -248,7 +248,7 @@ Send a unique sentinel string like `the-cake-is-a-lie-2026` from the UI,
 then look for it inside the dumped rows:
 
 ```bash
-docker compose exec postgres \
+docker compose exec postgres-primary \
   pg_dump -U chat -d chat --data-only --table='"Message"' \
   | grep -i 'the-cake-is-a-lie-2026' \
   || echo 'sentinel not found in any column — server stored only ciphertext'

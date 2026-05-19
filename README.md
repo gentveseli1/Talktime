@@ -34,10 +34,16 @@ server only ever stores ciphertext).
                │                   │                   │
                └─────────┬─────────┴─────────┬─────────┘
                          ▼                   ▼
-                  ┌─────────────┐     ┌─────────────┐
-                  │  Postgres   │     │   Redis     │
-                  │  (Prisma)   │     │  (pub/sub)  │
-                  └─────────────┘     └─────────────┘
+           ┌─────────────────┐ ┌───────────┐ ┌─────────────┐
+           │ postgres-primary│◀┤ writes    │ │   Redis     │
+           │   (writes)      │ └───────────┘ │  (pub/sub)  │
+           └────────┬────────┘               └─────────────┘
+                    │ WAL stream
+                    ▼
+           ┌─────────────────┐
+           │ postgres-replica│
+           │  (hot standby)  │
+           └─────────────────┘
 ```
 
 - **Nginx** distributes connections to three Node.js backends with `ip_hash`
@@ -47,7 +53,11 @@ server only ever stores ciphertext).
   node is delivered to a recipient connected to any other node — the backend
   is therefore **stateless** and horizontally scalable.
 - **Postgres** stores users (with their public keys) and ciphertext-only message
-  history. The server never has access to plaintext.
+  history. The server never has access to plaintext. The database tier is
+  **replicated**: `postgres-primary` accepts all writes and streams every
+  WAL record asynchronously to `postgres-replica`, a hot-standby that holds
+  a continuously updated copy of the ciphertext. See
+  [`docs/database-replication.md`](docs/database-replication.md).
 
 ## Tech stack
 
@@ -96,16 +106,19 @@ docker compose up --build
 
 This starts:
 
-| Service     | Address                | Notes                        |
-|-------------|------------------------|------------------------------|
-| Nginx       | http://localhost:8080  | Entry point for HTTP and WS  |
-| backend-1/2/3 | internal             | Reached only via Nginx       |
-| Postgres    | internal               | Volume: `postgres_data`      |
-| Redis       | internal               | Socket.IO pub/sub            |
+| Service           | Address                | Notes                                |
+|-------------------|------------------------|--------------------------------------|
+| Nginx             | http://localhost:8080  | Entry point for HTTP and WS          |
+| backend-1/2/3     | internal               | Reached only via Nginx               |
+| postgres-primary  | internal               | RW. Volume: `postgres_primary_data`  |
+| postgres-replica  | internal               | RO hot standby. Volume: `postgres_replica_data` |
+| Redis             | internal               | Socket.IO pub/sub                    |
 
 ### Run the initial database migration
 
-The first time you bring the stack up, create the schema:
+The first time you bring the stack up, create the schema on **the primary**
+(Prisma is configured to talk to `postgres-primary`; the replica receives
+the migration automatically through the WAL stream):
 
 ```bash
 docker compose exec backend-1 npx prisma migrate dev --name init
@@ -116,6 +129,15 @@ Regenerate the Prisma client after any schema change:
 ```bash
 docker compose exec backend-1 npx prisma generate
 ```
+
+> **Upgrading from Phase 4.** Phase 5 renames the database service from
+> `postgres` to `postgres-primary` and introduces a separate replica
+> volume. Existing volumes from earlier phases do not include the
+> replication role created by `infra/postgres/primary-init.sh`, which runs
+> only during `initdb`. The simplest upgrade is
+> `docker compose down -v && docker compose up --build -d`, followed by a
+> fresh `prisma migrate dev`. If keeping existing data matters, create the
+> role manually with `psql` instead.
 
 ### Run the frontend dev server
 
@@ -232,10 +254,11 @@ stop, host pull), see [`docs/proxmox-deployment.md`](docs/proxmox-deployment.md)
 
 ### 7. Show that the database holds only ciphertext
 
-After Alice and Bob have exchanged some messages, dump the `Message` table:
+After Alice and Bob have exchanged some messages, dump the `Message` table
+from the primary:
 
 ```bash
-docker compose exec postgres \
+docker compose exec postgres-primary \
   psql -U chat -d chat \
   -c 'SELECT id, "senderId", "recipientId", algorithm,
              left("ciphertextForRecipient", 32) AS recip_ct_head,
@@ -252,7 +275,7 @@ proof, type a unique sentinel like `the-cake-is-a-lie-2026` into the chat
 and then grep the dump for it:
 
 ```bash
-docker compose exec postgres \
+docker compose exec postgres-primary \
   pg_dump -U chat -d chat --data-only --table='"Message"' \
   | grep -i 'the-cake-is-a-lie-2026' \
   || echo 'sentinel not found in any column — server stored only ciphertext'
@@ -261,6 +284,93 @@ docker compose exec postgres \
 Expected output: the `sentinel not found ...` message. See
 [`docs/database-model.md`](docs/database-model.md) for the full schema
 walkthrough.
+
+### 8. Show that the encrypted history is replicated
+
+Run the same query against `postgres-replica` and confirm the rows are
+already there:
+
+```bash
+docker compose exec postgres-replica \
+  psql -U chat -d chat \
+  -c 'SELECT id, "senderId", "recipientId",
+             left("ciphertextForRecipient", 32) AS recip_ct_head,
+             "createdAt"
+        FROM "Message"
+        ORDER BY "createdAt" DESC
+        LIMIT 5;'
+```
+
+For a byte-for-byte comparison, hash one row's ciphertext on each side and
+verify they match:
+
+```bash
+docker compose exec postgres-primary \
+  psql -U chat -d chat -tAc \
+  'SELECT md5("ciphertextForRecipient") FROM "Message" ORDER BY "createdAt" DESC LIMIT 1;'
+
+docker compose exec postgres-replica \
+  psql -U chat -d chat -tAc \
+  'SELECT md5("ciphertextForRecipient") FROM "Message" ORDER BY "createdAt" DESC LIMIT 1;'
+```
+
+Finally confirm one server is writable and one is in standby:
+
+```bash
+docker compose exec postgres-primary psql -U chat -d chat -tAc 'SELECT pg_is_in_recovery();'  # f
+docker compose exec postgres-replica psql -U chat -d chat -tAc 'SELECT pg_is_in_recovery();'  # t
+```
+
+The full discussion lives in
+[`docs/database-replication.md`](docs/database-replication.md).
+
+## Database replication
+
+The PostgreSQL tier runs as a primary + hot-standby pair:
+
+- `postgres-primary` accepts all application writes and streams its WAL to
+  the replica.
+- `postgres-replica` re-applies that WAL continuously and serves read-only
+  queries (`SELECT` works, any `INSERT`/`UPDATE`/`DELETE` is rejected).
+- The replication role and the `pg_hba.conf` rule are provisioned by
+  `infra/postgres/primary-init.sh` (run by `initdb` on first start of the
+  primary).
+- The replica's data directory is cloned from the primary by `pg_basebackup`
+  on first boot of `postgres-replica`, driven by
+  `infra/postgres/replica-entrypoint.sh`.
+
+Because replication operates below the application layer, both servers hold
+the same ciphertext byte-for-byte and neither holds plaintext — the
+end-to-end encryption guarantee is preserved on the replica.
+
+### Verify replication
+
+```bash
+# 1. Both servers see the same encrypted history.
+docker compose exec postgres-primary psql -U chat -d chat \
+  -c 'SELECT count(*) FROM "Message";'
+docker compose exec postgres-replica psql -U chat -d chat \
+  -c 'SELECT count(*) FROM "Message";'
+
+# 2. Roles: primary writable, replica in standby.
+docker compose exec postgres-primary psql -U chat -d chat -tAc 'SELECT pg_is_in_recovery();'  # f
+docker compose exec postgres-replica psql -U chat -d chat -tAc 'SELECT pg_is_in_recovery();'  # t
+
+# 3. The primary sees a streaming connection from the replica.
+docker compose exec postgres-primary psql -U chat -d chat \
+  -c "SELECT application_name, client_addr, state, sync_state,
+             pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+        FROM pg_stat_replication;"
+
+# 4. The replica refuses writes.
+docker compose exec postgres-replica psql -U chat -d chat \
+  -c "INSERT INTO \"User\" (id, username, email, \"passwordHash\", \"publicKey\")
+      VALUES ('x','x','x','x','x');"
+# expected: ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+See [`docs/database-replication.md`](docs/database-replication.md) for the
+full design, Proxmox mapping, and failover discussion.
 
 ## Demoing the distributed behavior (lower level)
 
@@ -287,6 +397,9 @@ delivery, which is what makes the backend horizontally scalable.
 - [`docs/database-model.md`](docs/database-model.md) — `User` and `Message`
   schema, why two ciphertext columns exist, why no plaintext and no nonce
   column.
+- [`docs/database-replication.md`](docs/database-replication.md) — the
+  primary + hot-standby PostgreSQL setup, how WAL streaming preserves the
+  encryption guarantee, failover behaviour, and the Proxmox mapping.
 - [`docs/api-and-socket-contract.md`](docs/api-and-socket-contract.md) —
   authoritative reference for REST endpoints, Socket.IO events, request and
   response examples, and error codes.
@@ -310,9 +423,16 @@ delivery, which is what makes the backend horizontally scalable.
 - **Phase 3 — Thesis & demo readiness.** Documentation (this file and
   everything in `docs/`), reproducible demo script, encrypted-DB
   demonstration. ✅ done.
+- **Phase 4 — Delivery and read receipts.** `deliveredAt` / `readAt`
+  columns, `message:delivered` / `message:read` / `message:status` events,
+  Sent / Delivered / Read indicators in the UI. ✅ done.
+- **Phase 5 — Database replication.** `postgres-primary` + `postgres-replica`
+  via PostgreSQL streaming replication, encrypted history visible
+  byte-for-byte on both servers. ✅ done.
 - **Out of scope for v1.** Group chat, file upload, message pagination
   beyond the 200-row cap, key rotation, multi-device key sync, forward
-  secrecy, production-grade Nginx (TLS, rate limiting), automated tests.
+  secrecy, production-grade Nginx (TLS, rate limiting), automated tests,
+  automatic database failover (replica must be promoted manually).
 
 ## Proxmox deployment plan
 
@@ -342,7 +462,8 @@ plan, covering:
 | `docker compose stop backend-2`                            | Simulate node failure         |
 | `docker compose exec backend-1 npx prisma migrate dev`     | Apply schema migrations       |
 | `docker compose exec backend-1 npx prisma studio`          | Open Prisma Studio            |
-| `docker compose exec postgres psql -U chat -d chat -c 'SELECT id, "senderId", "recipientId", algorithm, left("ciphertextForRecipient", 32) FROM "Message" ORDER BY "createdAt" DESC LIMIT 5;'` | Check encrypted rows in DB |
+| `docker compose exec postgres-primary psql -U chat -d chat -c 'SELECT id, "senderId", "recipientId", algorithm, left("ciphertextForRecipient", 32) FROM "Message" ORDER BY "createdAt" DESC LIMIT 5;'` | Check encrypted rows on the primary |
+| `docker compose exec postgres-replica psql -U chat -d chat -c 'SELECT count(*) FROM "Message";'` | Check the replica's row count matches |
 | `docker compose down -v`                                   | Tear down + wipe the DB       |
 
 ## License

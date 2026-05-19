@@ -12,7 +12,8 @@ same commands and expect the same observable results.
 ## Environment under test
 
 - Docker Engine 29.4.1 (Compose v2)
-- 6 services: `postgres`, `redis`, `backend-1`, `backend-2`, `backend-3`, `nginx`
+- 7 services: `postgres-primary`, `postgres-replica`, `redis`, `backend-1`,
+  `backend-2`, `backend-3`, `nginx` (Phase 5 added `postgres-replica`)
 - Backend image built from `./backend` (Node.js 20, TypeScript, Express,
   Socket.IO, Prisma)
 - Frontend served by Vite dev server on `:5173` (not in the compose file,
