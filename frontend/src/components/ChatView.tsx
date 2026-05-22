@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type { Socket } from 'socket.io-client';
 import { api, type StoredMessage } from '../lib/api';
 import { decryptForCurrentUser, encryptForRecipient } from '../lib/crypto';
 import type { ChatUser } from './UserList';
+import { IconLock, IconShield, IconSend, IconCheck, IconCheckDouble } from './icons';
 
 type Me = {
   userId: string;
@@ -45,11 +46,16 @@ type Props = {
   me: Me;
   socket: Socket;
   recipient: ChatUser;
+  recipientOnline: boolean;
 };
 
 const TYPING_DEBOUNCE_MS = 1200;
 
-export function ChatView({ me, socket, recipient }: Props) {
+function initials(name: string): string {
+  return name.trim().slice(0, 2).toUpperCase() || '?';
+}
+
+export function ChatView({ me, socket, recipient, recipientOnline }: Props) {
   const [messages, setMessages] = useState<DecryptedMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -280,30 +286,53 @@ export function ChatView({ me, socket, recipient }: Props) {
   }
 
   return (
-    <section style={styles.section}>
-      <header style={styles.header}>
-        <strong>{recipient.username}</strong>
-        <span style={styles.muted}>
-          fp: <code>{recipient.publicKey.slice(0, 12)}…</code>
-        </span>
+    <section className="chat">
+      <header className="chat__head">
+        <span className="avatar">{initials(recipient.username)}</span>
+        <div className="chat__peer-text">
+          <div className="chat__name">{recipient.username}</div>
+          <div className="chat__sub">
+            <span className={`pdot ${recipientOnline ? 'pdot--online' : 'pdot--offline'}`} />
+            {recipientOnline ? 'Online' : 'Offline'}
+          </div>
+        </div>
+        <div className="chat__head-right">
+          <span className="e2ee-tag"><IconLock /> E2EE sealed</span>
+          <span className="chat__fp">key {recipient.publicKey.slice(0, 14)}…</span>
+        </div>
       </header>
 
-      <div ref={scrollRef} style={styles.thread}>
-        {loading && <p style={styles.muted}>Loading history…</p>}
+      <div ref={scrollRef} className="thread">
+        {loading && <div className="thread__note">Decrypting message history…</div>}
         {!loading && sorted.length === 0 && (
-          <p style={styles.muted}>No messages yet. Say hello — the server will only see ciphertext.</p>
+          <div className="msg-empty">
+            <div className="msg-empty__icon"><IconShield /></div>
+            <div className="msg-empty__title">No messages yet</div>
+            <p className="msg-empty__text">
+              Say hello — your message is sealed in this browser and the server only ever stores ciphertext.
+            </p>
+          </div>
         )}
         {sorted.map((m) => {
           const mine = m.senderId === me.userId;
+          const receipt = receiptInfo(m.deliveredAt, m.readAt);
           return (
-            <div
-              key={m.id}
-              style={{ ...styles.bubble, ...(mine ? styles.mine : styles.theirs) }}
-              title={new Date(m.createdAt).toLocaleString()}
-            >
-              <div>{m.plaintext}</div>
+            <div key={m.id} className={`msg-line ${mine ? 'msg-line--mine' : 'msg-line--theirs'}`}>
+              <div
+                className={`msg ${mine ? 'msg--mine' : 'msg--theirs'}`}
+                title={new Date(m.createdAt).toLocaleString()}
+              >
+                <div className="msg__body">{m.plaintext}</div>
+                <div className="msg__meta">
+                  <IconLock className="msg__lock" />
+                  <span className="msg__time">{formatTime(m.createdAt)}</span>
+                </div>
+              </div>
               {mine && (
-                <div style={styles.statusLine}>{describeStatus(m.deliveredAt, m.readAt)}</div>
+                <div className={`receipt receipt--${receipt.level}`}>
+                  {receipt.level === 'sent' ? <IconCheck /> : <IconCheckDouble />}
+                  {receipt.label}
+                </div>
               )}
             </div>
           );
@@ -311,24 +340,30 @@ export function ChatView({ me, socket, recipient }: Props) {
       </div>
 
       {recipientTyping && (
-        <div style={styles.typingIndicator} aria-live="polite">
-          {recipient.username} is typing…
+        <div className="typing" aria-live="polite">
+          <span className="typing__dots"><i /><i /><i /></span>
+          {recipient.username} is typing
         </div>
       )}
 
-      {error && <p style={styles.error}>{error}</p>}
+      {error && <p className="banner-error chat__error">{error}</p>}
 
-      <form onSubmit={handleSend} style={styles.composer}>
-        <input
-          value={draft}
-          onChange={(e) => handleDraftChange(e.target.value)}
-          placeholder={`Message ${recipient.username}…`}
-          style={styles.input}
-          autoFocus
-        />
-        <button type="submit" disabled={!draft.trim()} style={styles.send}>
-          Send
-        </button>
+      <form onSubmit={handleSend} className="composer">
+        <div className="composer__row">
+          <input
+            className="composer__input"
+            value={draft}
+            onChange={(e) => handleDraftChange(e.target.value)}
+            placeholder={`Message ${recipient.username}…`}
+            autoFocus
+          />
+          <button type="submit" className="composer__send" disabled={!draft.trim()} aria-label="Send message">
+            <IconSend />
+          </button>
+        </div>
+        <div className="composer__hint">
+          <IconLock /> Messages are encrypted before leaving this browser.
+        </div>
       </form>
     </section>
   );
@@ -354,55 +389,19 @@ function decryptStored(m: StoredMessage, me: Me): DecryptedMessage | null {
   }
 }
 
-function describeStatus(deliveredAt: string | null, readAt: string | null): string {
-  if (readAt) return 'Read';
-  if (deliveredAt) return 'Delivered';
-  return 'Sent';
+type ReceiptLevel = 'sent' | 'delivered' | 'read';
+
+function receiptInfo(
+  deliveredAt: string | null,
+  readAt: string | null,
+): { label: string; level: ReceiptLevel } {
+  if (readAt) return { label: 'Read', level: 'read' };
+  if (deliveredAt) return { label: 'Delivered', level: 'delivered' };
+  return { label: 'Sent', level: 'sent' };
 }
 
-const styles: Record<string, CSSProperties> = {
-  section: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 },
-  header: {
-    padding: '12px 16px',
-    borderBottom: '1px solid #ddd',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    gap: 12,
-  },
-  thread: {
-    flex: 1,
-    overflowY: 'auto',
-    padding: 16,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-  },
-  bubble: {
-    maxWidth: '70%',
-    padding: '8px 12px',
-    borderRadius: 12,
-    fontSize: 14,
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-  },
-  mine: { alignSelf: 'flex-end', background: '#dbeafe' },
-  theirs: { alignSelf: 'flex-start', background: '#f3f4f6' },
-  statusLine: {
-    fontSize: 11,
-    color: '#475569',
-    marginTop: 2,
-    textAlign: 'right',
-  },
-  typingIndicator: {
-    padding: '4px 16px',
-    fontSize: 12,
-    color: '#6b7280',
-    fontStyle: 'italic',
-  },
-  composer: { borderTop: '1px solid #ddd', padding: 12, display: 'flex', gap: 8 },
-  input: { flex: 1, padding: '8px 10px', fontSize: 14 },
-  send: { padding: '8px 14px' },
-  muted: { color: '#888', fontSize: 13 },
-  error: { color: '#b00', padding: '0 16px' },
-};
+function formatTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}

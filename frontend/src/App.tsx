@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import type { Socket } from 'socket.io-client';
 import { api, type AuthResponse, type PresenceEntry } from './lib/api';
 import { connectSocket, disconnectSocket } from './lib/socket';
@@ -6,11 +6,16 @@ import { generateKeyPair, ready as cryptoReady } from './lib/crypto';
 import { loadKeyPair, saveKeyPair } from './storage/keys';
 import { UserList, type ChatUser } from './components/UserList';
 import { ChatView } from './components/ChatView';
+import { IconLock, IconShield, IconKey, IconNodes, IconBolt, IconDatabase } from './components/icons';
 
 type Session = {
   user: AuthResponse;
   privateKey: string;
 };
+
+function initials(name: string): string {
+  return name.trim().slice(0, 2).toUpperCase() || '?';
+}
 
 export function App() {
   const [cryptoLoaded, setCryptoLoaded] = useState(false);
@@ -22,6 +27,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [healthNode, setHealthNode] = useState<string | null>(null);
   const [socketNode, setSocketNode] = useState<string | null>(null);
+  const [authTab, setAuthTab] = useState<'register' | 'login'>('register');
 
   useEffect(() => {
     cryptoReady.then(() => setCryptoLoaded(true));
@@ -137,56 +143,182 @@ export function App() {
   }
 
   if (!cryptoLoaded) {
-    return <main style={styles.center}><p>Loading libsodium…</p></main>;
+    return (
+      <div className="boot">
+        <div className="spinner" />
+        <div className="boot__text">Initializing libsodium encryption…</div>
+      </div>
+    );
   }
 
   if (!session) {
     return (
-      <main style={styles.auth}>
-        <h1>Distributed E2EE Chat</h1>
-        {error && <p style={styles.error}>{error}</p>}
-        <section style={styles.grid}>
-          <form onSubmit={handleRegister} style={styles.card}>
-            <h2>Register</h2>
-            <label>Username<input name="username" required minLength={3} /></label>
-            <label>Email<input name="email" type="email" required /></label>
-            <label>Password<input name="password" type="password" required minLength={8} /></label>
-            <button type="submit">Register &amp; generate keypair</button>
-            <p style={styles.muted}>
-              A new X25519 keypair is generated in your browser. The private key
-              is stored in IndexedDB and never sent to the server.
-            </p>
-          </form>
-          <form onSubmit={handleLogin} style={styles.card}>
-            <h2>Login</h2>
-            <label>Username<input name="username" required /></label>
-            <label>Password<input name="password" type="password" required /></label>
-            <button type="submit">Login</button>
-            <p style={styles.muted}>
-              Login only works on the device where you registered — the private
-              key lives in this browser's IndexedDB.
-            </p>
-          </form>
-        </section>
-      </main>
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <aside className="auth-aside">
+            <div className="auth-brand">
+              <span className="brand-mark"><IconLock /></span>
+              <div>
+                <div className="brand-name">TalkTime</div>
+                <div className="brand-sub">Distributed E2EE Chat</div>
+              </div>
+            </div>
+
+            <div>
+              <h2 className="auth-aside__title">End-to-end encrypted messaging on a distributed backend.</h2>
+              <p className="auth-aside__tag">
+                Private key stays in your browser. Server stores only encrypted ciphertext.
+              </p>
+            </div>
+
+            <ul className="sec-list">
+              <li className="sec-item">
+                <span className="sec-item__icon"><IconKey /></span>
+                <div>
+                  <div className="sec-item__title">Keys never leave your device</div>
+                  <div className="sec-item__text">
+                    An X25519 keypair is generated in your browser and the private key is kept in IndexedDB.
+                  </div>
+                </div>
+              </li>
+              <li className="sec-item">
+                <span className="sec-item__icon"><IconShield /></span>
+                <div>
+                  <div className="sec-item__title">Server sees only ciphertext</div>
+                  <div className="sec-item__text">
+                    Messages are sealed with libsodium before they ever leave this tab.
+                  </div>
+                </div>
+              </li>
+              <li className="sec-item">
+                <span className="sec-item__icon"><IconNodes /></span>
+                <div>
+                  <div className="sec-item__title">Distributed &amp; replicated</div>
+                  <div className="sec-item__text">
+                    3 backend nodes behind Nginx, Redis realtime, PostgreSQL primary/replica.
+                  </div>
+                </div>
+              </li>
+            </ul>
+
+            <div className="auth-badges">
+              <span className="badge badge--purple"><IconLock /> E2EE enabled</span>
+              <span className="badge badge--cyan"><IconNodes /> 3 nodes</span>
+              <span className="badge badge--cyan"><IconBolt /> Redis realtime</span>
+              <span className="badge badge--cyan"><IconDatabase /> DB replicated</span>
+            </div>
+          </aside>
+
+          <main className="auth-main">
+            <div className="auth-tabs">
+              <button
+                type="button"
+                className={`auth-tab ${authTab === 'register' ? 'auth-tab--active' : ''}`}
+                onClick={() => { setAuthTab('register'); setError(null); }}
+              >
+                Create account
+              </button>
+              <button
+                type="button"
+                className={`auth-tab ${authTab === 'login' ? 'auth-tab--active' : ''}`}
+                onClick={() => { setAuthTab('login'); setError(null); }}
+              >
+                Sign in
+              </button>
+            </div>
+
+            {error && <p className="banner-error">{error}</p>}
+
+            {authTab === 'register' ? (
+              <form onSubmit={handleRegister} className="auth-form">
+                <div>
+                  <h3 className="auth-head__title">Create a secure account</h3>
+                  <p className="auth-head__text">A fresh X25519 keypair is generated locally as you register.</p>
+                </div>
+                <label className="field">
+                  <span className="field__label">Username</span>
+                  <input className="input" name="username" required minLength={3} placeholder="alice" />
+                </label>
+                <label className="field">
+                  <span className="field__label">Email</span>
+                  <input className="input" name="email" type="email" required placeholder="alice@example.test" />
+                </label>
+                <label className="field">
+                  <span className="field__label">Password</span>
+                  <input className="input" name="password" type="password" required minLength={8} placeholder="At least 8 characters" />
+                </label>
+                <button type="submit" className="btn btn--primary btn--block">
+                  Register &amp; generate keypair
+                </button>
+                <p className="form-hint">
+                  <IconLock />
+                  The private key is stored in this browser's IndexedDB and is never sent to the server.
+                </p>
+              </form>
+            ) : (
+              <form onSubmit={handleLogin} className="auth-form">
+                <div>
+                  <h3 className="auth-head__title">Unlock your session</h3>
+                  <p className="auth-head__text">Your private key is loaded from this browser's local storage.</p>
+                </div>
+                <label className="field">
+                  <span className="field__label">Username</span>
+                  <input className="input" name="username" required placeholder="alice" />
+                </label>
+                <label className="field">
+                  <span className="field__label">Password</span>
+                  <input className="input" name="password" type="password" required placeholder="Your password" />
+                </label>
+                <button type="submit" className="btn btn--primary btn--block">
+                  Sign in
+                </button>
+                <p className="form-hint">
+                  <IconLock />
+                  Login only works on the device where you registered — the private key lives in this browser.
+                </p>
+              </form>
+            )}
+          </main>
+        </div>
+      </div>
     );
   }
 
   return (
-    <div style={styles.app}>
-      <header style={styles.appHeader}>
-        <strong>{session.user.username}</strong>
-        <span style={styles.muted}>
-          socket node: {socketNode ?? '—'} · health:&nbsp;
-          <button onClick={pingHealth} style={styles.linkButton}>check</button>
-          {healthNode ? ` ${healthNode}` : ''}
-        </span>
-        <button onClick={logout}>Log out</button>
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark"><IconLock /></span>
+          <div className="brand-text">
+            <div className="brand-name">TalkTime</div>
+            <div className="brand-sub">Distributed E2EE Chat</div>
+          </div>
+        </div>
+
+        <div className="sys-badges">
+          <span className="badge badge--purple"><IconLock /> E2EE enabled</span>
+          <span className="badge badge--cyan"><IconNodes /> 3 nodes</span>
+          <span className="badge badge--cyan"><IconBolt /> Redis realtime</span>
+          <span className="badge badge--cyan"><IconDatabase /> DB replicated</span>
+        </div>
+
+        <div className="topbar-right">
+          <button className="node-pill" onClick={pingHealth} title="Ping backend health">
+            <span className="node-pill__dot" />
+            node {socketNode ?? '—'}
+            {healthNode && <span className="node-pill__detail">· {healthNode}</span>}
+          </button>
+          <div className="user-chip">
+            <span className="avatar avatar--sm">{initials(session.user.username)}</span>
+            {session.user.username}
+          </div>
+          <button className="btn btn--ghost" onClick={logout}>Log out</button>
+        </div>
       </header>
 
-      {error && <p style={styles.error}>{error}</p>}
+      {error && <p className="banner-error">{error}</p>}
 
-      <div style={styles.workspace}>
+      <div className="workspace">
         <UserList
           users={users}
           selectedId={selected?.id ?? null}
@@ -204,57 +336,27 @@ export function App() {
             }}
             socket={socket}
             recipient={selected}
+            recipientOnline={presence.get(selected.id)?.online ?? false}
           />
         ) : (
-          <section style={styles.placeholder}>
-            <p style={styles.muted}>Select a person on the left to start an encrypted chat.</p>
+          <section className="placeholder">
+            <div className="placeholder__icon"><IconShield /></div>
+            <div>
+              <div className="placeholder__title">Select a peer to start an encrypted session</div>
+              <p className="placeholder__text">
+                Every message is sealed with an X25519 sealed-box inside your browser. The distributed
+                backend only ever relays and stores ciphertext.
+              </p>
+            </div>
+            <div className="placeholder__hints">
+              <span className="hint-chip"><IconKey /> X25519 sealed-box</span>
+              <span className="hint-chip"><IconNodes /> 3 backend nodes</span>
+              <span className="hint-chip"><IconBolt /> Redis pub/sub</span>
+              <span className="hint-chip"><IconDatabase /> Postgres primary + replica</span>
+            </div>
           </section>
         )}
       </div>
     </div>
   );
 }
-
-const styles: Record<string, CSSProperties> = {
-  center: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh' },
-  auth: {
-    maxWidth: 880,
-    margin: '40px auto',
-    padding: '0 20px',
-    fontFamily: 'system-ui, sans-serif',
-    lineHeight: 1.5,
-  },
-  grid: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 },
-  card: {
-    border: '1px solid #ddd',
-    borderRadius: 8,
-    padding: 20,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 10,
-  },
-  app: {
-    display: 'flex',
-    flexDirection: 'column',
-    height: '100vh',
-    fontFamily: 'system-ui, sans-serif',
-  },
-  appHeader: {
-    padding: '8px 16px',
-    borderBottom: '1px solid #ddd',
-    display: 'flex',
-    alignItems: 'center',
-    gap: 16,
-  },
-  workspace: { flex: 1, display: 'flex', minHeight: 0 },
-  placeholder: {
-    flex: 1,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 32,
-  },
-  muted: { color: '#666', fontSize: 13, marginRight: 'auto' },
-  linkButton: { background: 'none', border: 'none', color: '#2563eb', cursor: 'pointer', padding: 0 },
-  error: { color: '#b00', padding: '8px 16px', margin: 0 },
-};
